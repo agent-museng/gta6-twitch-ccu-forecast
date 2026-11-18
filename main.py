@@ -1,73 +1,68 @@
 #!/usr/bin/env python3
-"""GTA VI Twitch CCU forecaster v3 — make.fun gta6-twitch-ccu-forecast-01.
+"""GTA6 Twitch CCU forecast — round 5.
 
-Forecasts, for each of hours 2..24 of the release day (UTC), five quantiles of
-Twitch concurrent viewers in the "Grand Theft Auto VI" category, from the
-case's hour-1 print, its pre-release history, and the hourly curves of past
-big game launches shipped in the case file.
+Model (all computed at runtime from the case file, stdlib only):
+  For each hour h = 2..24, work in log-ratio space r = log(viewers_h / viewers_1).
+  - OLS: per-hour OLS of each comparable's log-ratio on its log hour-1
+    viewers, slope shrunk 10%, evaluated at the target's log hour-1.
+  - CONSOLE: per-hour median log-ratio over console-only comparables
+    (platforms string without "PC"), level-adjusted by an OLS slope fitted
+    on that subset: each comparable's ratio is shifted to the target's
+    level before taking the median.
+  - Blend: 0.25 * OLS + 0.75 * CONSOLE.
+  - DIP: pre-midnight dip ratio of the target (mean viewers in the 3 hours
+    before UTC midnight over mean viewers in hours -12..-4), centred on the
+    comparables' mean log DIP. Coefficient 1.375 plus a per-hour tilt of
+    +0.25 * (h - 13) / 11 (stronger late, weaker early).
+  - PROFILE: a smooth per-hour correction (piecewise-linear through knots),
+    fitted on the practice cases and their leave-one-out variants. It
+    corrects a systematic bias of the blend: the blend under-predicts the
+    US-East unlock wave (hours 5-8) and over-predicts the midday trough
+    (hours 11-14) and the first hour after midnight (hour 2).
+  - The median is clamped to the comparables' per-hour log-ratio envelope.
+  - Extreme hour-1 safeguard: the OLS evaluation point and the console
+    level adjustment are clamped to the comparables' observed log hour-1
+    range plus a 0.5 margin, so an hour-1 beyond every comparable (the
+    real GTA VI launch could exceed 1,000,000 viewers) cannot blow up
+    the forecast. The final quantiles still scale with the true hour-1.
+  - Quantiles: hour-1 * exp(median + z * 0.19), z the standard-normal
+    quantiles at 5/25/50/75/95%.
 
-Method (hybrid, fitted at runtime from the case's own comparables):
-  * Component A — per-hour OLS of log(viewers / hour-1) on log(hour-1) over
-    the comparable launches, with the slope shrunk 10% toward the mean shape.
-    Big launches grow less during the day; the slope captures that level
-    effect hour by hour.
-  * Component B — console-only shape: the per-hour median log-ratio over
-    comparables whose platforms list no PC (console launches dip deeper in
-    the morning and rise differently than PC-inclusive ones), plus a level
-    adjustment from an OLS slope fitted on that same console-only set around
-    its median launch size.
-  * Blend: 0.45 * A + 0.55 * B in log-ratio space.
-  * DIP correction: the target's pre-midnight DIP ratio (mean viewers in the
-    last 3h before UTC midnight / mean of hours -12..-4) shifts the whole
-    day's median by +1.0 * (log DIP - mean log DIP of the comparables).
-    A hot pre-midnight evening lifts the whole launch day; a cold one
-    lowers it. The slope is a fixed constant; the anchor is fitted from
-    the case's own comparables at runtime.
-  * Quantiles: hour-1 print x exp(median + z * 0.22), z the standard
-    normal quantiles at 5/25/50/75/95%.
-  * Predictions are clamped to the comparable envelope per hour, so no
-    forecast ever leaves the range past launches actually produced.
-
-Only the Python standard library is used. No network, no randomness:
-two runs on the same case write identical bytes.
-
-Input:  $MAKEFUN_INPUT_DIR (else /input/) — every *.in file, name order.
-Output: $MAKEFUN_OUTPUT_DIR (else /output/) — one <id>.out per case:
-{"hours": [{"hour": h, "q": [q05, q25, q50, q75, q95]}, ...]} for h 2..24.
+Everything is deterministic. No network, no files besides the case input.
 """
 
 import json
 import math
 import os
-import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# Standard normal quantiles at 0.05 / 0.25 / 0.5 / 0.75 / 0.95.
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
-     0.6744897501960817, 1.6448536269514722]
+Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722)
 
-SPREAD = 0.22        # log-spread of the forecast quantiles
-BLEND_W = 0.45       # weight of component A (all-comp OLS) in the blend
-SHRINK = 0.9         # slope shrinkage on component A
-DIP_SLOPE = 1.0      # slope of the DIP level correction
-DIP_ANCHOR_EVE = (14, 22)  # evening hours used to anchor the DIP mean
+W_OLS = 0.25
+SHRINK = 0.9
+DIP_K = 1.375
+DIP_SLOPE = 0.25
+SPREAD = 0.19
+# Profile knots: (hour, correction) — piecewise linear between knots.
+PROFILE_KNOTS = (
+    (2, -0.10),
+    (5, 0.16),
+    (8, 0.16),
+    (11, -0.10),
+    (14, -0.16),
+    (17, 0.00),
+    (20, 0.04),
+    (24, 0.02),
+)
 
-# The four practice launches: always kept as comparables (their names are
-# the only reliable key when a case file leaves them out of the tier list).
-PRACTICE_NAMES = {
-    "Marvel's Wolverine",
-    "Red Dead Redemption 2",
-    "God of War Ragnarök",
-    "Marvel's Spider-Man 2",
-}
 
-
-def parse_t(s):
+def _parse_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def median(xs):
+def _median(xs):
     xs = sorted(xs)
     n = len(xs)
     if n == 0:
@@ -75,250 +70,186 @@ def median(xs):
     return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
 
 
-def ols(xs, ys):
-    """Least squares y ~ a + b*x. Returns (a, b); b = 0 on a flat x."""
+def _ols(xs, ys):
     n = len(xs)
+    if n == 0:
+        return 0.0, 0.0
     mx = sum(xs) / n
     my = sum(ys) / n
     sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx < 1e-12:
-        return (my, 0.0)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx
-    return (my - b * mx, b)
+    if sxx == 0:
+        return my, 0.0
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return my - b * mx, b
 
 
-def hourly_map(hourly, day_start):
-    """offset-hours -> viewers (offset 0 = the release day's first hour)."""
-    m = {}
-    for r in hourly or []:
-        v = r.get("viewers")
-        if v is None or v <= 0:
+def _hour_viewers(hourly, day_start):
+    """Map release-day hour (1..24) -> viewers for one hourly series."""
+    out = {}
+    for row in hourly or []:
+        v = row.get("viewers")
+        if not v:
             continue
-        off = int((parse_t(r["from"]) - day_start).total_seconds() // 3600)
-        m[off] = float(v)
-    return m
-
-
-def dip_of(hm):
-    """Mean viewers in offsets -3..-1 / mean in offsets -12..-4, or None."""
-    num = [hm.get(o) for o in (-3, -2, -1)]
-    den = [hm.get(o) for o in range(-12, -3)]
-    if any(v is None for v in num) or any(v is None for v in den):
-        return None
-    return (sum(num) / 3.0) / (sum(den) / 9.0)
-
-
-def tier_of(c_raw):
-    m = re.search(r"Tier:\s*([a-z-]+)", c_raw.get("unlock") or "")
-    return m.group(1) if m else "none"
-
-
-def midnight_local(c_raw):
-    u = (c_raw.get("unlock") or "").lower()
-    return "midnight local" in u or "12 am local" in u
-
-
-class Comp:
-    """One comparable launch: hourly viewers keyed by offset from its day."""
-
-    def __init__(self, c):
-        self.name = c.get("name", "")
-        self.day_start = parse_t(c["day_start"])
-        self.hm = hourly_map(c.get("hourly"), self.day_start)
-        self.p1 = self.hm.get(0)
-        self.platforms = c.get("platforms") or ""
-
-    def ratio(self, h):
-        """Viewers at UTC hour h (1..24) / hour-1 viewers; None if missing."""
-        if not self.p1:
-            return None
-        v = self.hm.get(h - 1)
-        return None if v is None else v / self.p1
-
-    def dip(self):
-        return dip_of(self.hm)
-
-    def is_console_only(self):
-        """No PC in the platforms list: a console-only launch."""
-        return bool(self.platforms) and "PC" not in self.platforms
-
-
-def load_case(path):
-    """Parse a case file into hour-1 print, target DIP and comparables."""
-    with open(path, encoding="utf-8") as f:
-        d = json.load(f)
-    day_start = parse_t(d["day_start"])
-    p1 = max(1.0, float(d["known"][0]["viewers"]))
-    comps = []
-    for c in d.get("comparables") or []:
-        if (tier_of(c) == "comparable" or midnight_local(c)
-                or c.get("name") in PRACTICE_NAMES):
-            comps.append(Comp(c))
-    comps = [c for c in comps if c.p1 and c.p1 > 0]
-    if len(comps) < 8:
-        # Degenerate filter result: fall back to every usable comparable.
-        comps = [Comp(c) for c in d.get("comparables") or []]
-        comps = [c for c in comps if c.p1 and c.p1 > 0]
-    hm = hourly_map(d.get("history_hourly"), day_start)
-    return {"id": d["id"], "p1": p1, "comps": comps, "dip": dip_of(hm)}
-
-
-def log_ratios(case, h):
-    """(log p1, log ratio) pairs across comparables with data at hour h."""
-    pts = []
-    for c in case["comps"]:
-        r = c.ratio(h)
-        if r and r > 0:
-            pts.append((math.log(c.p1), math.log(r)))
-    return pts
-
-
-def clamp_to_envelope(case, med):
-    """Keep each hour's log-ratio inside the comparables' observed range."""
-    for h in range(2, 25):
-        rs = [lr for (_, lr) in log_ratios(case, h)]
-        if rs:
-            med[h] = max(min(rs), min(max(rs), med[h]))
-    return med
-
-
-def component_a(case):
-    """Per-hour OLS of log-ratio on log hour-1, slope shrunk toward 0.
-
-    Only comparables with a complete pre-midnight history enter the fit;
-    with fewer than 6 of them, fall back to the median log-ratio.
-    """
-    lp1 = math.log(case["p1"])
-    med = {}
-    for h in range(2, 25):
-        pts = []
-        for c in case["comps"]:
-            r = c.ratio(h)
-            pre = [c.hm.get(o) for o in (-3, -2, -1)]
-            if r and r > 0 and c.p1 and all(v is not None for v in pre):
-                pts.append((math.log(c.p1), math.log(r)))
-        if len(pts) < 6:
-            rs = [lr for (_, lr) in pts]
-            med[h] = median(rs) if rs else 0.0
-            continue
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        _, b = ols(xs, ys)
-        mx = sum(xs) / len(xs)
-        my = sum(ys) / len(ys)
-        med[h] = my + SHRINK * b * (lp1 - mx)
-    return clamp_to_envelope(case, med)
-
-
-def component_b(case):
-    """Console-only shape + level.
-
-    Shape: per-hour median log-ratio over console-only comparables.
-    Level: an OLS slope fitted on that same set shifts the shape by
-    (log hour-1 - median log hour-1 of the console-only set).
-    """
-    lp1 = math.log(case["p1"])
-    console = [c for c in case["comps"] if c.is_console_only()]
-    if len(console) < 3:
-        console = list(case["comps"])
-    anchor = median([math.log(c.p1) for c in console if c.p1])
-    med = {}
-    for h in range(2, 25):
-        rs = []
-        for c in console:
-            r = c.ratio(h)
-            if r and r > 0:
-                rs.append(math.log(r))
-        shape = median(rs) if rs else 0.0
-        pts = [(math.log(c.p1), math.log(c.ratio(h)))
-               for c in console if c.ratio(h) and c.ratio(h) > 0]
-        if len(pts) >= 5:
-            _, b = ols([p[0] for p in pts], [p[1] for p in pts])
-            med[h] = shape + b * (lp1 - anchor)
-        else:
-            med[h] = shape
-    return clamp_to_envelope(case, med)
-
-
-def dip_correction(case, med):
-    """Shift every hour's median by DIP_SLOPE * (log DIP - mean log DIP)."""
-    d = case["dip"]
-    if not d:
-        return med
-    xs = []
-    for c in case["comps"]:
-        cd = c.dip()
-        if not cd:
-            continue
-        eve = [math.log(c.ratio(h)) for h in range(DIP_ANCHOR_EVE[0],
-                                                   DIP_ANCHOR_EVE[1] + 1)
-               if c.ratio(h) and c.ratio(h) > 0]
-        if eve:
-            xs.append(math.log(cd))
-    if not xs:
-        return med
-    shift = DIP_SLOPE * (math.log(d) - sum(xs) / len(xs))
-    return {h: med[h] + shift for h in range(2, 25)}
-
-
-def forecast_case(case):
-    """Median log-ratios for hours 2..24, blended and DIP-corrected."""
-    a = component_a(case)
-    b = component_b(case)
-    med = {h: BLEND_W * a[h] + (1.0 - BLEND_W) * b[h] for h in range(2, 25)}
-    return dip_correction(case, med)
-
-
-def quantiles(p1, med_logratio):
-    """Five quantiles for one hour: p1 * exp(median + z * SPREAD)."""
-    m = p1 * math.exp(med_logratio)
-    qs = []
-    for z in Z:
-        q = m * math.exp(z * SPREAD)
-        q = min(1e9, max(1.0, q))
-        qs.append(q)
-    # Enforce non-decreasing after the caps (they already are, by z order).
-    for i in range(1, 5):
-        if qs[i] < qs[i - 1]:
-            qs[i] = qs[i - 1]
-    return qs
-
-
-def run_case(path, out_dir):
-    case_id = os.path.splitext(os.path.basename(path))[0]
-    out_path = os.path.join(out_dir, case_id + ".out")
-    try:
-        case = load_case(path)
-        med = forecast_case(case)
-        hours = [{"hour": h, "q": quantiles(case["p1"], med[h])}
-                 for h in range(2, 25)]
-    except Exception:
-        # Never crash the run: fall back to a flat hour-1 forecast.
         try:
-            with open(path, encoding="utf-8") as f:
-                d = json.load(f)
-            p1 = max(1.0, float(d["known"][0]["viewers"]))
-            cid = d.get("id", case_id)
+            t = _parse_ts(row["from"])
         except Exception:
-            p1 = 1.0
-            cid = case_id
-        hours = [{"hour": h, "q": [p1] * 5} for h in range(2, 25)]
-        out_path = os.path.join(out_dir, cid + ".out")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"hours": hours}, separators=(",", ":")))
+            continue
+        dh = (t - day_start).total_seconds() / 3600.0
+        h = int(round(dh)) + 1
+        if 1 <= h <= 24:
+            out[h] = float(v)
+    return out
+
+
+def _dip(hourly, day_start):
+    """Mean viewers in [D-3h, D) over mean viewers in [D-12h, D-4h)."""
+    def mean_in(a, b):
+        vals = []
+        for row in hourly or []:
+            v = row.get("viewers")
+            if not v:
+                continue
+            try:
+                t = _parse_ts(row["from"])
+            except Exception:
+                continue
+            if a <= t < b:
+                vals.append(float(v))
+        return sum(vals) / len(vals) if vals else None
+
+    num = mean_in(day_start - timedelta(hours=3), day_start)
+    den = mean_in(day_start - timedelta(hours=12),
+                  day_start - timedelta(hours=4))
+    if num is None or den is None or den <= 0:
+        return None
+    return num / den
+
+
+def _profile(hour):
+    knots = PROFILE_KNOTS
+    if hour <= knots[0][0]:
+        return knots[0][1]
+    for (h0, v0), (h1, v1) in zip(knots, knots[1:]):
+        if h0 <= hour <= h1:
+            t = (hour - h0) / (h1 - h0)
+            return v0 * (1 - t) + v1 * t
+    return knots[-1][1]
+
+
+def _comparable_features(comp):
+    try:
+        ds = _parse_ts(comp["day_start"])
+    except Exception:
+        return None
+    hv = _hour_viewers(comp.get("hourly"), ds)
+    if 1 not in hv or hv[1] <= 0:
+        return None
+    h1 = hv[1]
+    lr = {}
+    for h in range(2, 25):
+        if h in hv and hv[h] > 0:
+            lr[h] = math.log(hv[h] / h1)
+    if len(lr) < 20:
+        return None
+    platforms = str(comp.get("platforms") or "")
+    return {
+        "logh1": math.log(h1),
+        "lr": lr,
+        "dip": _dip(comp.get("hourly"), ds),
+        "console_only": "PC" not in platforms.upper(),
+    }
+
+
+def predict(case):
+    known = case.get("known") or [{}]
+    h1 = float(known[0].get("viewers") or 1.0)
+    if h1 < 1.0:
+        h1 = 1.0
+    logh1 = math.log(h1)
+
+    comps = []
+    for c in case.get("comparables") or []:
+        f = _comparable_features(c)
+        if f is not None:
+            comps.append(f)
+
+    # Extreme hour-1 safeguard: the OLS fit and the console level
+    # adjustment both extrapolate in log hour-1. Clamp the point at
+    # which they are evaluated to the comparables' observed log hour-1
+    # range plus a 0.5 margin, so an out-of-range hour-1 cannot blow
+    # up the forecast. The final quantiles still scale with the true
+    # hour-1; only the ratio prediction is guarded.
+    if comps:
+        _h1_lo = min(c["logh1"] for c in comps)
+        _h1_hi = max(c["logh1"] for c in comps)
+        logh1_eval = max(_h1_lo - 0.5, min(_h1_hi + 0.5, logh1))
+    else:
+        logh1_eval = logh1
+
+    # Target DIP from its own pre-checkpoint hourly history.
+    try:
+        day_start = _parse_ts(case["day_start"])
+    except Exception:
+        day_start = None
+    tdip = None
+    if day_start is not None:
+        tdip = _dip(case.get("history_hourly"), day_start)
+
+    dips = [c["dip"] for c in comps if c.get("dip")]
+    mean_logdip = (sum(math.log(d) for d in dips) / len(dips)) if dips else 0.0
+    dip_centred = (math.log(tdip) - mean_logdip) if tdip else 0.0
+
+    rows = []
+    for h in range(2, 25):
+        xs, ys = [], []
+        cxs, cys = [], []
+        all_lr = []
+        for c in comps:
+            if h in c["lr"]:
+                xs.append(c["logh1"])
+                ys.append(c["lr"][h])
+                all_lr.append(c["lr"][h])
+                if c["console_only"]:
+                    cxs.append(c["logh1"])
+                    cys.append(c["lr"][h])
+        if not xs:
+            med = 0.0
+            lo = hi = 0.0
+        else:
+            a, b = _ols(xs, ys)
+            ols_med = a + (b * SHRINK) * logh1_eval
+            if len(cxs) >= 3:
+                ca, cb = _ols(cxs, cys)
+                cons_med = _median(
+                    [y - cb * (x - logh1_eval) for x, y in zip(cxs, cys)])
+            elif cys:
+                cons_med = _median(cys)
+            else:
+                cons_med = ols_med
+            dip_k = DIP_K + DIP_SLOPE * (h - 13) / 11.0
+            med = (W_OLS * ols_med + (1.0 - W_OLS) * cons_med
+                   + dip_k * dip_centred + _profile(h))
+            lo, hi = min(all_lr), max(all_lr)
+            med = max(lo, min(hi, med))
+        qs = [h1 * math.exp(med + z * SPREAD) for z in Z]
+        qs = [max(q, 1.0) for q in qs]
+        rows.append({"hour": h, "q": qs})
+    return {"hours": rows}
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input/"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output/"
     os.makedirs(out_dir, exist_ok=True)
-    try:
-        names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
-    except OSError:
-        names = []
+    names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
     for name in names:
-        run_case(os.path.join(in_dir, name), out_dir)
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as f:
+            case = json.load(f)
+        out = predict(case)
+        stem = name[:-3]
+        with open(os.path.join(out_dir, stem + ".out"), "w",
+                  encoding="utf-8") as f:
+            json.dump(out, f)
     return 0
 
 
